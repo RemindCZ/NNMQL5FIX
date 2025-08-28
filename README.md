@@ -1,31 +1,31 @@
 # NNMQL5FIX
 
-**NNMQL5FIX — Lehká MLP DLL pro MetaTrader 5 (x64, MSVC)**
+**NNMQL5FIX — Lightweight MLP DLL for MetaTrader 5 (x64, MSVC)**
 
-Autor: **Remind — Tomáš Bělák**  
-Licence: **MIT-like** (užijte, ale uveďte autorství)
+Author: **Remind — Tomáš Bělák**  
+License: **MIT-like** (use freely, but credit the author)
 
-Malá, numericky stabilní MLP knihovna jako DLL pro MQL5.  
-Bez externích závislostí, čisté C API, 64-bit, MSVC.  
+A small, numerically stable MLP library as a DLL for MQL5.  
+No external dependencies, pure C API, 64-bit, MSVC.  
 
-Funkce:  
-- dopředný průchod  
-- učení (SGD)  
-- mini-batch obálky  
-- přístup k vahám  
+Features:  
+- forward pass  
+- training (SGD)  
+- mini-batch wrappers  
+- weight access  
 
 ---
 
-## Vlastnosti
+## Features
 
-- Stabilní sigmoid (bez overflow/underflow)  
-- Přesné dot-produkty: Neumaierova kompenzace + FMA  
-- Kompenzované sumace MSE i batch MSE  
-- Gradient clipping a konzervativní numerika  
-- Čisté C exporty (žádné STL přes hranici DLL)  
-- Build s `/MT` (statický CRT) → bez VC++ Redistributable  
+- Stable sigmoid (no overflow/underflow)  
+- Accurate dot products: Neumaier compensation + FMA  
+- Compensated summation for MSE and batch MSE  
+- Gradient clipping and conservative numerics  
+- Pure C exports (no STL across DLL boundary)  
+- Build with `/MT` (static CRT) → no VC++ Redistributable required  
 
-**Pozn.:** Tato verze je sekvenční (paralelismus vypnutý).
+**Note:** This version is sequential (parallelism disabled).
 
 ---
 
@@ -56,56 +56,56 @@ Funkce:
 #include "pch.h"
 ```
 
-**Nastavení:**
+**Settings:**
 - `pch.cpp` → C/C++ → Precompiled Headers → **Create (/Yc)**, Header: `pch.h`  
-- Ostatní `.cpp` → **Use (/Yu)**, Header: `pch.h`  
-- Každý `.cpp` musí začínat:  
+- Other `.cpp` files → **Use (/Yu)**, Header: `pch.h`  
+- Each `.cpp` must start with:  
   ```cpp
   #include "pch.h"
   ```
 
-### Statický CRT
+### Static CRT
 - Release: `/MT`  
 - Debug: `/MTd`  
 
-### Cíl
-- Platforma: **x64**  
-- Rebuild projektu  
+### Target
+- Platform: **x64**  
+- Rebuild project  
 
-### Ověření
+### Verification
 ```bash
 dumpbin /dependents NNMQL5FIX.dll
 ```
-V seznamu nesmí být `VCRUNTIME*`, `UCRTBASE.dll`.
+The list must not contain `VCRUNTIME*`, `UCRTBASE.dll`.
 
 ---
 
-## API (exporty)
+## API (exports)
 
-| Funkce | Popis |
-|--------|-------|
-| `int NN_Create()` | Vytvoří instanci sítě, vrací handle `h > 0`. |
-| `void NN_Free(int h)` | Zruší instanci. |
-| `bool NN_AddDense(int h, int inSz, int outSz, int act)` | Přidá dense vrstvu. Aktivace: `0=SIGMOID`, `1=RELU`, `2=TANH`, `3=LINEAR`, `4=SYM_SIG`. |
-| `int NN_InputSize(int h)` | Velikost vstupu sítě. |
-| `int NN_OutputSize(int h)` | Velikost výstupu sítě. |
-| `bool NN_Forward(...)` | Dopředný průchod pro 1 vzorek. |
-| `bool NN_ForwardBatch(...)` | Dopředný průchod pro batch vzorků (řádky). |
-| `bool NN_TrainOne(...)` | Učení 1 vzorku (SGD), vrací MSE. |
-| `bool NN_TrainBatch(...)` | Učení po dávkách (sekvenční, průměrné MSE). |
-| `bool NN_GetWeights(...)` | Načte váhy/biasy vrstvy *i*. |
-| `bool NN_SetWeights(...)` | Zapíše váhy/biasy vrstvy *i*. |
+| Function | Description |
+|----------|-------------|
+| `int NN_Create()` | Creates a network instance, returns handle `h > 0`. |
+| `void NN_Free(int h)` | Frees an instance. |
+| `bool NN_AddDense(int h, int inSz, int outSz, int act)` | Adds a dense layer. Activations: `0=SIGMOID`, `1=RELU`, `2=TANH`, `3=LINEAR`, `4=SYM_SIG`. |
+| `int NN_InputSize(int h)` | Network input size. |
+| `int NN_OutputSize(int h)` | Network output size. |
+| `bool NN_Forward(...)` | Forward pass for 1 sample. |
+| `bool NN_ForwardBatch(...)` | Forward pass for a batch of samples (rows). |
+| `bool NN_TrainOne(...)` | Train with 1 sample (SGD), returns MSE. |
+| `bool NN_TrainBatch(...)` | Batch training (sequential, average MSE). |
+| `bool NN_GetWeights(...)` | Reads weights/biases of layer *i*. |
+| `bool NN_SetWeights(...)` | Writes weights/biases of layer *i*. |
 
-**Formát batchů:**
-- `in` má velikost `batch * in_len` (samples po řádcích)  
-- `out` má velikost `batch * out_len`  
-- `tgt` má velikost `batch * tgt_len`
+**Batch format:**
+- `in` size: `batch * in_len` (samples by rows)  
+- `out` size: `batch * out_len`  
+- `tgt` size: `batch * tgt_len`
 
 ---
 
-## Použití v MQL5
+## Usage in MQL5
 
-### Import blok
+### Import block
 ```mql
 #import "NNMQL5FIX.dll"
 int  NN_Create();
@@ -122,18 +122,18 @@ bool NN_SetWeights(int h, int i, const double &W[], int Wlen, const double &b[],
 #import
 ```
 
-### Mini-příklad
+### Mini-example
 ```mql
 int h = NN_Create();
 NN_AddDense(h, 32, 64, 2); // TANH
 NN_AddDense(h, 64, 1, 3);  // LINEAR
 
-// dopředný průchod
+// forward pass
 double x[32]; ArrayInitialize(x, 0.0);
 double y[1];
 NN_Forward(h, x, 32, y, 1);
 
-// učení mini-batche
+// training mini-batch
 const int B = 16;
 double in[B*32], tgt[B*1];
 double mean_mse = 0.0;
@@ -142,30 +142,30 @@ NN_TrainBatch(h, in, B, 32, tgt, 1, 0.001, mean_mse);
 NN_Free(h);
 ```
 
-DLL umístěte do `MQL5\Libraries\`.  
-EA/indikátor poběží **bez VC++ redistributable**.
+Place DLL into `MQL5\Libraries\`.  
+EA/indicator will run **without VC++ redistributable**.
 
 ---
 
-## Numerické poznámky
+## Numerical notes
 
-- Sigmoid je implementován stabilně (větve pro `x ≥ 0` a `x < 0`)  
-- Dot produkty: `std::fma` + Neumaierova kompenzace  
-- MSE a batch MSE: kompenzované sumace  
-- Učení: SGD s **gradient clippingem (±5.0)**  
-
----
-
-## Omezení a doporučení
-
-- Sekvenční provedení (bez vláken); každý handle je nezávislý  
-- Nepřenášejte objekty STL přes hranici DLL (API je čisté C, bezpečné)  
-- `in_len` a `out_len` musí odpovídat topologii sítě, jinak funkce vrátí `false`  
-- Aktivace: `0=SIG`, `1=RELU`, `2=TANH`, `3=LINEAR`, `4=SYM_SIG`  
+- Sigmoid implemented stably (branches for `x ≥ 0` and `x < 0`)  
+- Dot products: `std::fma` + Neumaier compensation  
+- MSE and batch MSE: compensated summations  
+- Training: SGD with **gradient clipping (±5.0)**  
 
 ---
 
-## Struktura repozitáře
+## Limitations and recommendations
+
+- Sequential execution (no threads); each handle is independent  
+- Do not pass STL objects across the DLL boundary (API is pure C, safe)  
+- `in_len` and `out_len` must match network topology, otherwise functions return `false`  
+- Activations: `0=SIG`, `1=RELU`, `2=TANH`, `3=LINEAR`, `4=SYM_SIG`  
+
+---
+
+## Repository structure
 
 ```
 NNMQL5FIX/
@@ -173,22 +173,22 @@ NNMQL5FIX/
 │  ├─ dllmain.cpp
 │  ├─ pch.h
 │  └─ pch.cpp
-├─ build/           # výstupy (DLL, LIB, PDB)
+├─ build/           # outputs (DLL, LIB, PDB)
 ├─ examples/
-│  └─ MQL5/         # ukázky importu v indikátoru/EA
+│  └─ MQL5/         # import examples in indicator/EA
 └─ README.md
 ```
 
 ---
 
-## Licence
+## License
 
-MIT-like spirit — používejte svobodně, ale prosím uveďte **Remind — Tomáš Bělák**.  
-Bez záruky; software je poskytován **„tak jak je“**.
+MIT-like spirit — use freely, but please credit **Remind — Tomáš Bělák**.  
+No warranty; software is provided **“as is”**.
 
 ---
 
-## Poděkování
+## Acknowledgments
 
-Díky komunitě kolem MQL5 a všem, kdo mají rádi čistou numeriku a jednoduché API.  
-Pull requesty vítány.
+Thanks to the MQL5 community and everyone who loves clean numerics and simple APIs.  
+Pull requests welcome.
