@@ -137,6 +137,7 @@
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
       <BuildStlModules>true</BuildStlModules>
       <AdditionalIncludeDirectories>D:\Repos\NNMQL5FIX\NNMQL5FIX\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OpenMPSupport>true</OpenMPSupport>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -146,30 +147,17 @@
     </Link>
     <CudaCompile>
       <CodeGeneration>compute_86,sm_86</CodeGeneration>
-      <GPUDebugInfo>true</GPUDebugInfo>
+      <GPUDebugInfo>false</GPUDebugInfo>
       <GenerateLineInfo>true</GenerateLineInfo>
       <CudaRuntime>Shared</CudaRuntime>
       <Include>C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\include;%(Include)</Include>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="..\..\SemkiAI\src\include\SemkiAI.hpp" />
     <ClInclude Include="framework.h" />
-    <ClInclude Include="NNMQL5_CUDA.cuh" />
-    <ClInclude Include="pch.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
-  </ItemGroup>
-  <ItemGroup>
-    <CudaCompile Include="..\..\SemkiAI\src\Perceptron.cu" />
-    <CudaCompile Include="NNMQL5_CUDA.cu" />
-    <CudaCompile Include="Perceptron\ActivationFunctions.cu" />
-    <CudaCompile Include="Perceptron\CostFunctions.cu" />
-    <CudaCompile Include="Perceptron\LearningAlgorithms.cu" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="readme.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

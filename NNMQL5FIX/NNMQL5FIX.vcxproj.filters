@@ -18,29 +18,10 @@
     <ClInclude Include="framework.h">
       <Filter>Hlavičkové soubory</Filter>
     </ClInclude>
-    <ClInclude Include="pch.h">
-      <Filter>Hlavičkové soubory</Filter>
-    </ClInclude>
-    <ClInclude Include="..\..\SemkiAI\src\include\SemkiAI.hpp">
-      <Filter>Hlavičkové soubory</Filter>
-    </ClInclude>
-    <ClInclude Include="NNMQL5_CUDA.cuh">
-      <Filter>Hlavičkové soubory</Filter>
-    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
       <Filter>Zdrojové soubory</Filter>
     </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <CudaCompile Include="Perceptron\ActivationFunctions.cu" />
-    <CudaCompile Include="Perceptron\CostFunctions.cu" />
-    <CudaCompile Include="Perceptron\LearningAlgorithms.cu" />
-    <CudaCompile Include="..\..\SemkiAI\src\Perceptron.cu" />
-    <CudaCompile Include="NNMQL5_CUDA.cu" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="readme.md" />
   </ItemGroup>
 </Project>
