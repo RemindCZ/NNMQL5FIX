@@ -1,14 +1,11 @@
 // ============================================================================
-//  dllmain.cpp — High-Performance MLP DLL for MQL5 (x64, MSVC)
-//  --------------------------------------------------------------------------
-//  VERSION: 4.0 (Robust ABI, Zero-Alloc Training Loop, Safe Load/Save, OMP reduce)
-//  NOTES:
-//   - Exportní API zachováno (NN_Create, NN_AddDense, NN_TrainBatch, ...)
-//   - Calling convention sjednocena na __stdcall (pro MQL5 nejbezpečnější).
-//   - Trénink: žádné alokace uvnitř batch/layer smyček.
-//   - MSE: průměr přes batch i output_size (skutečné "mean squared error").
-//   - Load: nikdy nevrací true při částečném načtení.
-//   - UI: robustnější ošetření selhání CreateWindow/Timer.
+//  dllmain.cpp — DLL pro MQL5: vícevrstvý perceptron (MLP), x64, MSVC
+//
+//  Poznámky k souboru (psané ve stresu):
+//   - Držíme se C ABI + __stdcall, protože MQL5 je alergik na kreativitu.
+//   - Přes hranici DLL nepouštíme výjimky. MetaTrader by se urazil a odešel.
+//   - Trénink: snaha držet horké smyčky bez alokací. (Aspoň tam, kde to bolí.)
+//   - Výpočty v double, protože přesnost je levnější než noční ladění.
 // ============================================================================
 
 #define NOMINMAX
@@ -31,10 +28,10 @@
 #include <random>
 #include <cstdio>
 
-#include <omp.h> // /openmp
+#include <omp.h> // /openmp — když už máme CPU, tak ať se taky zapotí
 
 // ---------------------------------------------------------------------------
-// ABI
+// ABI a exporty — žádné překvapení pro MQL5
 // ---------------------------------------------------------------------------
 #ifndef DLL_EXTERN
 #define DLL_EXTERN extern "C" __declspec(dllexport)
@@ -44,13 +41,14 @@
 #define DLL_CALL __stdcall
 #endif
 
-// Bezpečná bariéra proti výjimkám (MetaTrader nesnáší C++ výjimky přes ABI)
+// Jednoduchá záchranná síť: výjimky ven nepustíme, ať se svět nezhroutí
 #define DLL_CATCH_ALL(retval) \
     catch (const std::exception&) { return retval; } \
     catch (...) { return retval; }
 
 // ---------------------------------------------------------------------------
-// Hyperparametry
+// Hyperparametry optimalizéru
+// (Ano, jde to nastavovat líp, ale nejdřív ať to vůbec žije.)
 // ---------------------------------------------------------------------------
 struct HyperParams {
     double lr = 0.001;
@@ -63,12 +61,14 @@ struct HyperParams {
 static HINSTANCE g_hInst = nullptr;
 
 // ---------------------------------------------------------------------------
-// RNG (rychlé + thread-safe bez globálního mutexu v horké smyčce)
+// RNG — thread_local generátor, aby se nám thready nehádaly o jeden mutex
+// Pozn.: seed je globální, ale generátor je per-thread.
 // ---------------------------------------------------------------------------
 namespace rng {
     static std::atomic<uint64_t> g_seed{ 1234567ULL };
 
     inline void seed(uint64_t s) {
+        // nula jako seed je podezřelá, tak ji opravíme
         g_seed.store(s ? s : 1ULL, std::memory_order_relaxed);
     }
 
@@ -77,6 +77,7 @@ namespace rng {
     }
 
     inline double uniform(double minv, double maxv) {
+        // mix seed + adresa gen (protože každý thread má vlastní gen)
         thread_local std::mt19937_64 gen{ base_seed() ^ (uint64_t)(uintptr_t)&gen };
         std::uniform_real_distribution<double> dist(minv, maxv);
         return dist(gen);
@@ -84,11 +85,11 @@ namespace rng {
 }
 
 // ---------------------------------------------------------------------------
-// Precizní matematika
+// Přesnější matematika — tady se bojuje s numerikou, ne s egem
 // ---------------------------------------------------------------------------
 namespace precise {
     inline double sigmoid(double x) {
-        // numericky stabilní sigmoid
+        // stabilní sigmoid: aby exp() nezpůsobilo existenciální krizi
         if (x >= 0.0) {
             const double z = std::exp(-x);
             return 1.0 / (1.0 + z);
@@ -99,7 +100,7 @@ namespace precise {
         }
     }
 
-    // Neumaier summation (lepší než Kahan pro různá měřítka)
+    // Neumaierova suma: lepší součet pro různé řády velikosti
     inline double neumaier_add(double sum, double val, double& comp) {
         const double t = sum + val;
         if (std::abs(sum) >= std::abs(val)) comp += (sum - t) + val;
@@ -108,6 +109,7 @@ namespace precise {
     }
 
     inline double dot_product(const double* a, const double* b, size_t n) {
+        // dot produkt s kompenzací — méně plovoucích duchů v akumulaci
         double sum = 0.0, c = 0.0;
         for (size_t i = 0; i < n; ++i) {
             const double prod = a[i] * b[i];
@@ -118,7 +120,8 @@ namespace precise {
 }
 
 // ---------------------------------------------------------------------------
-// AdamW (stav momentů)
+// AdamW — stav momentů pro parametry
+// Pozn.: decoupled weight decay, protože „Adam + L2“ není totéž.
 // ---------------------------------------------------------------------------
 struct AdamState {
     std::vector<double> m;
@@ -141,6 +144,7 @@ struct AdamState {
         const size_t n = params.size();
         if (grads.size() != n || m.size() != n || v.size() != n) return;
 
+        // bias correction: jinak jsou první kroky „moc skromné“
         const double bc1 = 1.0 - std::pow(hp.beta1, (double)t);
         const double bc2 = 1.0 - std::pow(hp.beta2, (double)t);
         const double inv_bc1 = (bc1 != 0.0) ? (1.0 / bc1) : 1.0;
@@ -149,7 +153,7 @@ struct AdamState {
         for (size_t i = 0; i < n; ++i) {
             const double g = grads[i];
 
-            // Decoupled weight decay
+            // oddělený weight decay — nejdřív „zchladit“ váhu, pak Adam krok
             params[i] -= hp.lr * hp.weight_decay * params[i];
 
             m[i] = hp.beta1 * m[i] + (1.0 - hp.beta1) * g;
@@ -164,7 +168,7 @@ struct AdamState {
 };
 
 // ---------------------------------------------------------------------------
-// Aktivace
+// Aktivace — nic magického, jen standardní zoologická zahrada
 // ---------------------------------------------------------------------------
 enum class ActKind : int { SIGMOID = 0, RELU = 1, TANH = 2, LINEAR = 3, SYM_SIG = 4 };
 
@@ -175,27 +179,28 @@ struct Activation {
         case ActKind::RELU:    return (x > 0.0) ? x : 0.0;
         case ActKind::TANH:    return std::tanh(x);
         case ActKind::SYM_SIG: return 2.0 * precise::sigmoid(x) - 1.0;
-        default:               return x; // LINEAR
+        default:               return x; // LINEAR — aneb „nech to být“
         }
     }
-    // derivace d(a)/d(z) — pro ReLU používáme z (nebo x), u ostatních stačí a
+
+    // Derivace d(a)/d(z). Někde stačí a, u ReLU radši koukáme na z.
     static double df(ActKind k, double a, double z) {
         switch (k) {
         case ActKind::SIGMOID: return a * (1.0 - a);
         case ActKind::RELU:    return (z > 0.0) ? 1.0 : 0.0;
         case ActKind::TANH:    return 1.0 - a * a;
         case ActKind::SYM_SIG: return 0.5 * (1.0 - a * a);
-        default:               return 1.0; // LINEAR
+        default:               return 1.0; // LINEAR — derivace je „pořád 1“
         }
     }
 };
 
 // ---------------------------------------------------------------------------
-// Dense vrstva
+// Dense vrstva — váhy, biasy, aktivace, Adam stav
 // ---------------------------------------------------------------------------
 struct DenseLayer {
     size_t in_sz = 0, out_sz = 0;
-    std::vector<double> W; // [out][in] row-major
+    std::vector<double> W; // [out][in] v row-major, aby to bylo jednoduché
     std::vector<double> b; // [out]
     ActKind act = ActKind::LINEAR;
     AdamState adam_W, adam_b;
@@ -206,7 +211,8 @@ struct DenseLayer {
         adam_W.resize(W.size());
         adam_b.resize(b.size());
 
-        // He pro ReLU, Xavier pro ostatní (jednoduchá, ale rozumná volba)
+        // Inicializace: pro ReLU He, jinak něco jako Xavier
+        // (Ne, není to akademická dokonalost. Ale funguje to.)
         const double scale = (k == ActKind::RELU)
             ? std::sqrt(2.0 / (double)in_sz)
             : std::sqrt(1.0 / (double)in_sz);
@@ -215,6 +221,7 @@ struct DenseLayer {
     }
 
     void forward(const double* x, double* z, double* a) const {
+        // Pro každý výstupní neuron spočítáme dot(W_row, x) + b
         for (size_t o = 0; o < out_sz; ++o) {
             double v = precise::dot_product(&W[o * in_sz], x, in_sz) + b[o];
             z[o] = v;
@@ -222,8 +229,7 @@ struct DenseLayer {
         }
     }
 
-    // Backward:
-    //  dL/da (out_sz) + (x,in_sz,z,out_sz,a,out_sz) -> dL/dx (in_sz) + gradW + gradb
+    // Backward: dL/da -> dL/dx + gradienty W a b
     void backward(const double* dL_da,
         const double* x,
         const double* z,
@@ -232,22 +238,22 @@ struct DenseLayer {
         double* gradW,
         double* gradb) const
     {
-        // dL/dz pro každý output neuron
-        // zároveň bias grad
-        // Pozn.: dL_dx musíme nulovat před akumulací
+        // dL_dx akumulujeme přes všechny výstupy, takže začneme od nuly
         std::fill(dL_dx, dL_dx + in_sz, 0.0);
 
         for (size_t o = 0; o < out_sz; ++o) {
             const double dz = dL_da[o] * Activation::df(act, a[o], z[o]);
+
+            // bias: derivace podle b je prostě dz (klasika)
             gradb[o] += dz;
 
-            // gradW řádek o
+            // váhy: gw[o,i] += dz * x[i]
             double* gw = &gradW[o * in_sz];
             for (size_t i = 0; i < in_sz; ++i) {
                 gw[i] += dz * x[i];
             }
 
-            // backprop do dL_dx
+            // zpětný tok do vstupu: dL_dx[i] += W[o,i] * dz
             const double* wrow = &W[o * in_sz];
             for (size_t i = 0; i < in_sz; ++i) {
                 dL_dx[i] += wrow[i] * dz;
@@ -260,28 +266,29 @@ struct DenseLayer {
         const HyperParams& hp,
         uint64_t t)
     {
+        // Adam krok pro váhy i biasy
         adam_W.update(W, gradW, hp, t);
         adam_b.update(b, gradb, hp, t);
     }
 };
-
 // ---------------------------------------------------------------------------
-// NeuralNetwork (MLP) — zero-alloc training loop
+// NeuralNetwork (MLP) — správa vrstev + trénink batchů
 // ---------------------------------------------------------------------------
 class NeuralNetwork {
     std::vector<std::unique_ptr<DenseLayer>> layers;
     size_t input_size = 0, output_size = 0;
     uint64_t time_step = 0;
 
+    // Kontext pro jeden thread: buffery, aby se v OMP smyčce nealokovalo
     struct ThreadContext {
-        // Buffery pro forward
-        std::vector<std::vector<double>> Z; // [layer][out]
-        std::vector<std::vector<double>> A; // [layer][out]
-        std::vector<double> X0;             // vstup (kopie pro pohodlí)
+        // Forward buffery pro každou vrstvu
+        std::vector<std::vector<double>> Z; // před-aktivace (z)
+        std::vector<std::vector<double>> A; // aktivace (a)
+        std::vector<double> X0;             // kopie vstupu (ano, kopie; pohodlí vítězí)
 
-        // Ping-pong delty (max(in/out) per layer, ale držíme zvlášť po layer)
-        std::vector<double> delta_curr; // dim = out_size aktuální vrstvy (nebo output)
-        std::vector<double> delta_prev; // dim = in_size aktuální vrstvy
+        // Dvě sady delt pro ping-pong (abychom nepsali do toho, z čeho čteme)
+        std::vector<double> delta_curr; // aktuální delta (typicky out dim)
+        std::vector<double> delta_prev; // předchozí delta (typicky in dim)
 
         void resize(const std::vector<std::unique_ptr<DenseLayer>>& Ls, size_t in_sz) {
             Z.resize(Ls.size());
@@ -292,12 +299,13 @@ class NeuralNetwork {
             }
             X0.assign(in_sz, 0.0);
 
-            // delta buffery budou resize podle aktuální vrstvy při backprop (bez alokace ve smyčce)
+            // delty zatím necháme prázdné, dimenze se odvodí v backprop
             delta_curr.clear();
             delta_prev.clear();
         }
 
         void ensure_delta_sizes(size_t curr, size_t prev) {
+            // tady se snažíme vyhnout alokacím uvnitř smyčky — když to jde
             if (delta_curr.size() != curr) delta_curr.assign(curr, 0.0);
             else std::fill(delta_curr.begin(), delta_curr.end(), 0.0);
 
@@ -306,6 +314,7 @@ class NeuralNetwork {
         }
     };
 
+    // Gradienty pro jednu vrstvu
     struct LayerGrads {
         std::vector<double> gW;
         std::vector<double> gb;
@@ -319,6 +328,7 @@ class NeuralNetwork {
             std::fill(gb.begin(), gb.end(), 0.0);
         }
         void add_inplace(const LayerGrads& other) {
+            // sčítání gradientů mezi thready
             const size_t nW = gW.size();
             const size_t nb = gb.size();
             for (size_t i = 0; i < nW; ++i) gW[i] += other.gW[i];
@@ -328,8 +338,10 @@ class NeuralNetwork {
 
 public:
     bool add_dense(size_t in_sz, size_t out_sz, ActKind k) {
+        // základní validace: prázdná vrstva je k ničemu
         if (in_sz == 0 || out_sz == 0) return false;
 
+        // první vrstva definuje input_size, další musí navazovat
         if (layers.empty()) input_size = in_sz;
         else if (layers.back()->out_sz != in_sz) return false;
 
@@ -346,7 +358,9 @@ public:
         if (layers.empty()) return false;
         if ((int)input_size != in_len || (int)output_size != out_len) return false;
 
-        // Buffery bez zbytečných alokací ve smyčce: držíme dvě vektory a swap
+        // Jednoduchý forward: přehazujeme vektory, aby se nám to hezky četlo.
+        // (Jo, alokuje to vektory; pro inference by šel udělat lepší „buffer reuse“,
+        //  ale tohle je srozumitelné a funkční.)
         std::vector<double> x(input_size);
         std::memcpy(x.data(), in, sizeof(double) * input_size);
 
@@ -366,6 +380,7 @@ public:
         const double* tgt, int tgt_len,
         double lr, double* mean_mse)
     {
+        // kontrola vstupů: nejlepší bug je ten, který nepustíš dovnitř
         if (!in || !tgt) return false;
         if (layers.empty()) return false;
         if (batch <= 0) return false;
@@ -376,10 +391,12 @@ public:
         HyperParams hp;
         hp.lr = lr;
 
+        // časový krok pro Adam (a pro pocit, že se něco hýbe dopředu)
         ++time_step;
 
         const int max_threads = std::max(1, omp_get_max_threads());
 
+        // Kontexty a gradienty pro každý thread
         std::vector<ThreadContext> ctxs(max_threads);
         std::vector<std::vector<LayerGrads>> grads(max_threads);
 
@@ -391,14 +408,15 @@ public:
             }
         }
 
-        // Nulování gradientů (na začátku každého batch callu)
+        // Na startu batch callu vynulujeme gradienty
         for (int t = 0; t < max_threads; ++t) {
             for (size_t i = 0; i < layers.size(); ++i) grads[t][i].zero();
         }
 
-        double total_sse = 0.0; // suma čtverců chyb (SSE)
+        // SSE = suma čtverců chyb (MSE se dodělá až na konci)
+        double total_sse = 0.0;
 
-        // Paralelní zpracování vzorků
+        // Paralelizace přes vzorky v batchi
 #pragma omp parallel reduction(+:total_sse)
         {
             const int tid = omp_get_thread_num();
@@ -419,29 +437,29 @@ public:
                     layers[i]->forward(x_in, ctx.Z[i].data(), ctx.A[i].data());
                 }
 
-                // 2) Loss + delta na výstupu:
-                // d/dy ( (1/NK) * sum (y-t)^2 ) = 2*(y-t)/(N*K)
-                // My akumulujeme SSE a MSE vyrobíme až nakonec.
+                // 2) Loss + delta na výstupu
+                // Použijeme MSE přes batch i výstupy:
+                // d/dy ( (1/(N*K)) * sum (y-t)^2 ) = 2*(y-t)/(N*K)
+                // (Ano, je to opravdu „mean“ – ne „sum“. Ať se to pak neplete.)
                 const double inv_NK = 1.0 / ((double)batch * (double)output_size);
 
-                // delta_curr = dL/da na výstupu
                 ctx.ensure_delta_sizes(output_size, layers.back()->in_sz);
+
                 for (size_t j = 0; j < output_size; ++j) {
                     const double err = ctx.A.back()[j] - t_ptr[j];
                     total_sse += err * err;
-                    ctx.delta_curr[j] = 2.0 * err * inv_NK;
+                    ctx.delta_curr[j] = 2.0 * err * inv_NK; // delta = dL/da na výstupu
                 }
 
-                // 3) Backward (ping-pong delta_curr -> delta_prev)
-                // delta_curr má dim out_sz vrstvy i
+                // 3) Backward: jedeme vrstvy odzadu a posíláme deltu dál
                 for (int li = (int)layers.size() - 1; li >= 0; --li) {
                     const DenseLayer* L = layers[(size_t)li].get();
                     const size_t curr_out = L->out_sz;
                     const size_t curr_in = L->in_sz;
 
-                    // připrav delta_prev (dim curr_in) bez alokace ve smyčce
+                    // Příprava bufferů: v ideálním světě bez alokací
                     if (ctx.delta_curr.size() != curr_out) {
-                        // bezpečnostní fallback (nemělo by nastat)
+                        // fallback: nemělo by nastat, ale radši než segfault
                         ctx.delta_curr.assign(curr_out, 0.0);
                     }
                     if (ctx.delta_prev.size() != curr_in) {
@@ -452,6 +470,7 @@ public:
                     }
 
                     const double* x_in = (li == 0) ? ctx.X0.data() : ctx.A[(size_t)li - 1].data();
+
                     L->backward(ctx.delta_curr.data(),
                         x_in,
                         ctx.Z[(size_t)li].data(),
@@ -460,36 +479,40 @@ public:
                         tg[(size_t)li].gW.data(),
                         tg[(size_t)li].gb.data());
 
-                    // swap: delta_curr <- delta_prev (bez alokace)
+                    // Posun delty pro další vrstvu (směrem ke vstupu)
+                    // (Tady je to memcpy; šlo by to udělat swapem a ušetřit kopii,
+                    //  ale zatím volíme jednoduchost.)
                     ctx.delta_curr.resize(curr_in);
                     std::memcpy(ctx.delta_curr.data(), ctx.delta_prev.data(), sizeof(double) * curr_in);
                 }
             }
         } // omp parallel
 
-        // Redukce gradientů (sekvenčně, deterministické a jednoduché)
+        // Redukce gradientů: sečteme threadové gradienty do [0]
+        // Děláme to sekvenčně — jednoduché, deterministické, bez závodů.
         for (int t = 1; t < max_threads; ++t) {
             for (size_t i = 0; i < layers.size(); ++i) {
                 grads[0][i].add_inplace(grads[t][i]);
             }
         }
 
-        // Update
+        // Update parametrů přes AdamW
         for (size_t i = 0; i < layers.size(); ++i) {
             layers[i]->update(grads[0][i].gW, grads[0][i].gb, hp, time_step);
         }
 
+        // Výstupní MSE: total_sse / (N*K)
         if (mean_mse) {
-            // total_sse už je suma přes batch i output, dělíme (batch*output) -> skutečné MSE
             *mean_mse = total_sse / ((double)batch * (double)output_size);
         }
         return true;
     }
 
     // -----------------------------------------------------------------------
-    // Save/Load (binární, robustní)
+    // Uložení / načtení sítě (binárně)
     // -----------------------------------------------------------------------
     static bool write_exact(FILE* f, const void* p, size_t sz) {
+        // chceme přesně sz bajtů, nic míň, nic víc
         return (std::fwrite(p, 1, sz, f) == sz);
     }
     static bool read_exact(FILE* f, void* p, size_t sz) {
@@ -498,10 +521,12 @@ public:
 
     bool save(const wchar_t* filename) const {
         if (!filename || !*filename) return false;
+
         FILE* f = nullptr;
         if (_wfopen_s(&f, filename, L"wb") != 0 || !f) return false;
 
-        const uint32_t magic = 0x4E4E3031; // "NN01"
+        // jednoduchý header: magic + verze + počet vrstev + timestep
+        const uint32_t magic = 0x4E4E3031; // "NN01" (jo, čitelné i v hexu)
         const uint32_t version = 2;
         const uint32_t cnt = (uint32_t)layers.size();
         const uint64_t ts = time_step;
@@ -533,6 +558,7 @@ public:
 
     bool load(const wchar_t* filename) {
         if (!filename || !*filename) return false;
+
         FILE* f = nullptr;
         if (_wfopen_s(&f, filename, L"rb") != 0 || !f) return false;
 
@@ -548,7 +574,7 @@ public:
 
         if (!ok) { std::fclose(f); return false; }
 
-        // načteme do dočasné sítě a až pak swap (aby při chybě nezůstala polomrtvola)
+        // načítáme do nové sítě a teprve potom přehodíme — bezpečnější pro chyby
         std::vector<std::unique_ptr<DenseLayer>> new_layers;
         new_layers.reserve(cnt);
 
@@ -566,17 +592,21 @@ public:
             if (d_in == 0 || d_out == 0) { ok = false; break; }
             const ActKind act = (ActKind)act_code;
 
+            // kontrola návaznosti rozměrů
             if (i == 0) new_input = (size_t)d_in;
             else {
                 if (new_layers.back()->out_sz != (size_t)d_in) { ok = false; break; }
             }
 
+            // vytvoříme vrstvu (tím vzniknou správně velké buffery)
             auto L = std::make_unique<DenseLayer>((size_t)d_in, (size_t)d_out, act);
 
+            // přepíšeme váhy a biasy ze souboru
             ok = ok && read_exact(f, L->W.data(), sizeof(double) * L->W.size());
             ok = ok && read_exact(f, L->b.data(), sizeof(double) * L->b.size());
             if (!ok) break;
 
+            // Adam stav po loadu nulujeme — začínáme „čistě“
             L->adam_W.reset();
             L->adam_b.reset();
 
@@ -586,6 +616,7 @@ public:
 
         std::fclose(f);
 
+        // buď jsme načetli všechno, nebo nic
         if (!ok || new_layers.size() != (size_t)cnt) return false;
 
         layers.swap(new_layers);
@@ -595,9 +626,9 @@ public:
         return true;
     }
 };
-
 // ---------------------------------------------------------------------------
-// UI (Win32 GDI) — jednoduchý MSE monitor, robustnější životní cyklus
+// Jednoduché UI okno (Win32 GDI) pro zobrazení průběhu MSE
+// Pozn.: Je to utilitka, ne Photoshop. Má to jen říct „lepší / horší“.
 // ---------------------------------------------------------------------------
 namespace ui {
     struct MSEState {
@@ -621,8 +652,10 @@ namespace ui {
     static const wchar_t* kTitle = L"MSE Monitor";
 
     static void DrawMSEGraph(HDC hdc, const RECT& rc) {
+        // pozadí: bílé a čisté, jako naše svědomí po refaktoringu
         FillRect(hdc, &rc, (HBRUSH)(COLOR_WINDOW + 1));
 
+        // kopie dat, ať nekreslíme pod zámkem (mutexy do grafu nepatří)
         std::deque<double> local;
         {
             std::lock_guard<std::mutex> lk(g.mtx);
@@ -632,6 +665,7 @@ namespace ui {
 
         double vmin = 0.0, vmax = 1.0;
         if (g.autoscale) {
+            // autoscale: najdeme min/max z posledních hodnot
             vmin = std::numeric_limits<double>::infinity();
             vmax = -std::numeric_limits<double>::infinity();
             for (double v : local) {
@@ -640,9 +674,12 @@ namespace ui {
             }
         }
         else {
+            // ruční měřítko: uživatel ví, co dělá (nebo si to aspoň myslí)
             vmin = g.y_min;
             vmax = g.y_max;
         }
+
+        // když je min == max, graf by byl placka, tak mu dáme prostor dýchat
         if (!(vmin < vmax)) vmax = vmin + 1.0;
 
         const int W = (rc.right - rc.left);
@@ -650,6 +687,7 @@ namespace ui {
         const int N = (int)local.size();
         if (W <= 1 || H <= 1 || N < 2) return;
 
+        // modrá linka: aby to vypadalo „profesionálně“
         HPEN pen = CreatePen(PS_SOLID, 2, RGB(0, 120, 215));
         HGDIOBJ old = SelectObject(hdc, pen);
 
@@ -670,6 +708,7 @@ namespace ui {
         SelectObject(hdc, old);
         DeleteObject(pen);
 
+        // poslední hodnota jako text: rychlé „jak moc to bolí“
         wchar_t buf[128];
         swprintf_s(buf, L"MSE: %.6g", local.back());
         TextOutW(hdc, rc.left + 6, rc.top + 6, buf, (int)wcslen(buf));
@@ -685,17 +724,21 @@ namespace ui {
             EndPaint(h, &ps);
             return 0;
         }
+
         case WM_TIMER:
+            // timer jen invaliduje okno, kreslení se udělá v WM_PAINT
             if (g.running.load(std::memory_order_relaxed)) {
                 InvalidateRect(h, NULL, FALSE);
             }
             return 0;
 
         case WM_CLOSE:
+            // zavři to civilizovaně
             DestroyWindow(h);
             return 0;
 
         case WM_DESTROY:
+            // okno zmizelo, message loop se může rozloučit
             g.hwnd = nullptr;
             PostQuitMessage(0);
             return 0;
@@ -704,6 +747,7 @@ namespace ui {
     }
 
     static bool EnsureClassRegistered() {
+        // registrace třídy okna jen jednou
         if (g.class_registered.load(std::memory_order_acquire)) return true;
 
         WNDCLASSW wc{};
@@ -713,7 +757,7 @@ namespace ui {
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
 
         if (!RegisterClassW(&wc)) {
-            // pokud už existuje z dřívějška, bereme jako OK
+            // když už existuje, tak to neřešíme (DLL mohla být reloadnuta)
             if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
         }
         g.class_registered.store(true, std::memory_order_release);
@@ -721,6 +765,7 @@ namespace ui {
     }
 
     static DWORD WINAPI ThreadProc(LPVOID) {
+        // UI poběží ve vlastním threadu, protože nechceme blokovat trénink
         if (!EnsureClassRegistered()) {
             g.running.store(false, std::memory_order_release);
             return 0;
@@ -739,8 +784,10 @@ namespace ui {
             return 0;
         }
 
+        // timer na periodické překreslení
         SetTimer(g.hwnd, 1, 100, NULL);
 
+        // klasický message loop: stará škola, ale funguje už dekády
         MSG msg;
         while (GetMessageW(&msg, 0, 0, 0) > 0) {
             TranslateMessage(&msg);
@@ -752,15 +799,18 @@ namespace ui {
 
     void show(int s) {
         if (s) {
+            // zapnout okno, pokud už neběží
             if (g.running.load(std::memory_order_acquire)) return;
             g.running.store(true, std::memory_order_release);
 
             g.thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, &g.tid);
             if (!g.thread) {
+                // thread nevznikl — no tak nic, UI si dnes nedá kafe
                 g.running.store(false, std::memory_order_release);
             }
         }
         else {
+            // vypnout okno: pošleme WM_CLOSE a necháme ho uklidit se samo
             if (g.hwnd) {
                 PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
             }
@@ -768,17 +818,20 @@ namespace ui {
     }
 
     void push(double v) {
+        // přidání hodnoty do fronty
         std::lock_guard<std::mutex> lk(g.mtx);
         g.data.push_back(v);
         while (g.data.size() > g.max_points) g.data.pop_front();
     }
 
     void clear() {
+        // smazat historii, protože někdy prostě potřebuješ „nový začátek“
         std::lock_guard<std::mutex> lk(g.mtx);
         g.data.clear();
     }
 
     void set_scale(int e, double mn, double mx) {
+        // buď autoscale, nebo ruční rozsah
         std::lock_guard<std::mutex> lk(g.mtx);
         g.autoscale = (e != 0);
         g.y_min = mn;
@@ -786,16 +839,18 @@ namespace ui {
     }
 
     void set_pts(int n) {
+        // kolik bodů si pamatujeme (větší = hezčí graf, menší = méně paměti)
         if (n <= 0) return;
         std::lock_guard<std::mutex> lk(g.mtx);
         g.max_points = (size_t)n;
     }
 
     void shutdown() {
-        // jemný shutdown, bez TerminateThread
+        // slušné vypnutí: žádné TerminateThread, nejsme barbaři
         if (g.hwnd) PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
 
         if (g.thread) {
+            // počkáme chvíli, ať se message loop stihne rozloučit
             WaitForSingleObject(g.thread, 5000);
             CloseHandle(g.thread);
             g.thread = nullptr;
@@ -806,13 +861,14 @@ namespace ui {
 }
 
 // ---------------------------------------------------------------------------
-// Instance manager
+// Správa instancí sítí — jednoduché handle ID -> objekt
 // ---------------------------------------------------------------------------
 static std::unordered_map<int, std::unique_ptr<NeuralNetwork>> g_nn;
 static std::mutex g_nn_mtx;
 static int g_nn_next = 1;
 
 static int nn_alloc() {
+    // vytvoříme novou síť a vrátíme handle; když to spadne, vrátíme 0
     try {
         std::lock_guard<std::mutex> lk(g_nn_mtx);
         const int h = g_nn_next++;
@@ -825,34 +881,40 @@ static int nn_alloc() {
 }
 
 static NeuralNetwork* nn_get(int h) {
+    // najdi handle a vrať pointer (po zámkem, aby to nebyla loterie)
     std::lock_guard<std::mutex> lk(g_nn_mtx);
     auto it = g_nn.find(h);
     return (it != g_nn.end()) ? it->second.get() : nullptr;
 }
 
 static void nn_free(int h) {
+    // uvolnění jedné instance
     std::lock_guard<std::mutex> lk(g_nn_mtx);
     g_nn.erase(h);
 }
 
 static void nn_clear_all() {
+    // hromadný úklid (třeba při unloadu DLL)
     std::lock_guard<std::mutex> lk(g_nn_mtx);
     g_nn.clear();
 }
-
 // ---------------------------------------------------------------------------
-// DLL EXPORTS (API zachováno)
+// Exportované funkce DLL — tohle je „veřejná tvář“ pro MQL5
+// Pozn.: Všude try/catch, protože MQL5 nechce překvapení ani k Vánocům.
 // ---------------------------------------------------------------------------
 DLL_EXTERN int  DLL_CALL NN_Create() {
+    // alokace nové sítě, vrací handle (0 = smutek)
     return nn_alloc();
 }
 
 DLL_EXTERN void DLL_CALL NN_Free(int h) {
+    // uvolnění instance podle handle
     try { nn_free(h); }
     catch (...) {}
 }
 
 DLL_EXTERN bool DLL_CALL NN_AddDense(int h, int i, int o, int a) {
+    // přidání Dense vrstvy: in, out, aktivační funkce
     try {
         auto* n = nn_get(h);
         return n ? n->add_dense((size_t)i, (size_t)o, (ActKind)a) : false;
@@ -864,6 +926,7 @@ DLL_EXTERN bool DLL_CALL NN_TrainBatch(int h,
     const double* t, int tl,
     double lr, double* mse)
 {
+    // natrénuj jeden batch, volitelně vrať MSE
     try {
         auto* n = nn_get(h);
         return n ? n->train_batch(in, b, il, t, tl, lr, mse) : false;
@@ -871,6 +934,7 @@ DLL_EXTERN bool DLL_CALL NN_TrainBatch(int h,
 }
 
 DLL_EXTERN bool DLL_CALL NN_Forward(int h, const double* in, int il, double* out, int ol) {
+    // inference: vezmi vstup a vrať výstup
     try {
         auto* n = nn_get(h);
         return n ? n->forward(in, il, out, ol) : false;
@@ -878,6 +942,7 @@ DLL_EXTERN bool DLL_CALL NN_Forward(int h, const double* in, int il, double* out
 }
 
 DLL_EXTERN bool DLL_CALL NN_Save(int h, const wchar_t* p) {
+    // uložit síť do souboru (bin)
     try {
         auto* n = nn_get(h);
         return n ? n->save(p) : false;
@@ -885,6 +950,7 @@ DLL_EXTERN bool DLL_CALL NN_Save(int h, const wchar_t* p) {
 }
 
 DLL_EXTERN bool DLL_CALL NN_Load(int h, const wchar_t* p) {
+    // načíst síť ze souboru (bin)
     try {
         auto* n = nn_get(h);
         return n ? n->load(p) : false;
@@ -892,6 +958,7 @@ DLL_EXTERN bool DLL_CALL NN_Load(int h, const wchar_t* p) {
 }
 
 DLL_EXTERN int DLL_CALL NN_InputSize(int h) {
+    // velikost vstupu
     try {
         auto* n = nn_get(h);
         return n ? (int)n->in_size() : 0;
@@ -899,6 +966,7 @@ DLL_EXTERN int DLL_CALL NN_InputSize(int h) {
 }
 
 DLL_EXTERN int DLL_CALL NN_OutputSize(int h) {
+    // velikost výstupu
     try {
         auto* n = nn_get(h);
         return n ? (int)n->out_size() : 0;
@@ -906,18 +974,24 @@ DLL_EXTERN int DLL_CALL NN_OutputSize(int h) {
 }
 
 DLL_EXTERN void DLL_CALL NN_SetSeed(unsigned int s) {
+    // seed pro inicializaci vah atd.
+    // (ano, determinismus je občas lepší než meditace)
     try { rng::seed((uint64_t)s); }
     catch (...) {}
 }
 
-// UI
+// ---------------------------------------------------------------------------
+// UI exporty — „MSE monitor“
+// ---------------------------------------------------------------------------
 DLL_EXTERN void DLL_CALL NN_MSE_Push(double m) { try { ui::push(m); } catch (...) {} }
 DLL_EXTERN void DLL_CALL NN_MSE_Show(int s) { try { ui::show(s); } catch (...) {} }
 DLL_EXTERN void DLL_CALL NN_MSE_Clear() { try { ui::clear(); } catch (...) {} }
 DLL_EXTERN void DLL_CALL NN_MSE_SetMaxPoints(int n) { try { ui::set_pts(n); } catch (...) {} }
 DLL_EXTERN void DLL_CALL NN_MSE_SetAutoScale(int e, double mn, double mx) { try { ui::set_scale(e, mn, mx); } catch (...) {} }
 
-// Cleanup
+// ---------------------------------------------------------------------------
+// Globální úklid — když chceš všechno zavřít a začít znovu
+// ---------------------------------------------------------------------------
 DLL_EXTERN void DLL_CALL NN_GlobalCleanup() {
     try {
         ui::shutdown();
@@ -927,15 +1001,17 @@ DLL_EXTERN void DLL_CALL NN_GlobalCleanup() {
 }
 
 // ---------------------------------------------------------------------------
-// DllMain
+// DllMain — životní cyklus DLL
 // ---------------------------------------------------------------------------
 BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
+        // uložíme instanci a vypneme thread notifikace (méně režie, méně rizika)
         g_hInst = (HINSTANCE)h;
         DisableThreadLibraryCalls(h);
     }
     else if (r == DLL_PROCESS_DETACH) {
-        // obrana proti visícímu UI threadu při unloadu
+        // při unloadu uklidit: UI thread i instance sítí
+        // (protože „visící okno“ je klasika, co umí zkazit den)
         ui::shutdown();
         nn_clear_all();
     }
