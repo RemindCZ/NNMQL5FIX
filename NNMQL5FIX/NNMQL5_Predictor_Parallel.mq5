@@ -6,7 +6,7 @@
 #property copyright "Remind"
 #property link      "https://remind.cz"
 #property version   "4.00"
-#property icon      "BPNDLL.ico"
+//#property icon      "BPNDLL.ico"
 #property description "MLP Predictor s realtime tréninkem a realtime vykreslením."
 
 #property strict
@@ -781,3 +781,4 @@ void DrawFuture(const double &o[], const double &h[], const double &l[], const d
      }
   }
 //+------------------------------------------------------------------+
+
