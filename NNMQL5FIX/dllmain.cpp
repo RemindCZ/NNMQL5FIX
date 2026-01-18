@@ -121,7 +121,7 @@ namespace precise {
 
 // ---------------------------------------------------------------------------
 // AdamW — stav momentů pro parametry
-// Pozn.: decoupled weight decay, protože „Adam + L2“ není totéž.
+// Pozn.: decoupled weight decay, protože "Adam + L2" není totéž.
 // ---------------------------------------------------------------------------
 struct AdamState {
     std::vector<double> m;
@@ -144,7 +144,7 @@ struct AdamState {
         const size_t n = params.size();
         if (grads.size() != n || m.size() != n || v.size() != n) return;
 
-        // bias correction: jinak jsou první kroky „moc skromné“
+        // bias correction: jinak jsou první kroky "moc skromné"
         const double bc1 = 1.0 - std::pow(hp.beta1, (double)t);
         const double bc2 = 1.0 - std::pow(hp.beta2, (double)t);
         const double inv_bc1 = (bc1 != 0.0) ? (1.0 / bc1) : 1.0;
@@ -153,7 +153,7 @@ struct AdamState {
         for (size_t i = 0; i < n; ++i) {
             const double g = grads[i];
 
-            // oddělený weight decay — nejdřív „zchladit“ váhu, pak Adam krok
+            // oddělený weight decay — nejdřív "zchladit" váhu, pak Adam krok
             params[i] -= hp.lr * hp.weight_decay * params[i];
 
             m[i] = hp.beta1 * m[i] + (1.0 - hp.beta1) * g;
@@ -167,9 +167,9 @@ struct AdamState {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Aktivace — nic magického, jen standardní zoologická zahrada
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------
+// Aktivace — nic magického, jen standardní zoologická zahrada, stejně nás zajímá jen symetrický TANH
+// --------------------------------------------------------------------------------------------------
 enum class ActKind : int { SIGMOID = 0, RELU = 1, TANH = 2, LINEAR = 3, SYM_SIG = 4 };
 
 struct Activation {
@@ -179,7 +179,7 @@ struct Activation {
         case ActKind::RELU:    return (x > 0.0) ? x : 0.0;
         case ActKind::TANH:    return std::tanh(x);
         case ActKind::SYM_SIG: return 2.0 * precise::sigmoid(x) - 1.0;
-        default:               return x; // LINEAR — aneb „nech to být“
+        default:               return x; // LINEAR — aneb "nech to být"
         }
     }
 
@@ -190,7 +190,7 @@ struct Activation {
         case ActKind::RELU:    return (z > 0.0) ? 1.0 : 0.0;
         case ActKind::TANH:    return 1.0 - a * a;
         case ActKind::SYM_SIG: return 0.5 * (1.0 - a * a);
-        default:               return 1.0; // LINEAR — derivace je „pořád 1“
+        default:               return 1.0; // LINEAR — derivace je "pořád 1"
         }
     }
 };
@@ -359,7 +359,7 @@ public:
         if ((int)input_size != in_len || (int)output_size != out_len) return false;
 
         // Jednoduchý forward: přehazujeme vektory, aby se nám to hezky četlo.
-        // (Jo, alokuje to vektory; pro inference by šel udělat lepší „buffer reuse“,
+        // (Jo, alokuje to vektory; pro inference by šel udělat lepší "buffer reuse",
         //  ale tohle je srozumitelné a funkční.)
         std::vector<double> x(input_size);
         std::memcpy(x.data(), in, sizeof(double) * input_size);
@@ -440,7 +440,7 @@ public:
                 // 2) Loss + delta na výstupu
                 // Použijeme MSE přes batch i výstupy:
                 // d/dy ( (1/(N*K)) * sum (y-t)^2 ) = 2*(y-t)/(N*K)
-                // (Ano, je to opravdu „mean“ – ne „sum“. Ať se to pak neplete.)
+                // (Ano, je to opravdu "mean" – ne "sum". Ať se to pak neplete.)
                 const double inv_NK = 1.0 / ((double)batch * (double)output_size);
 
                 ctx.ensure_delta_sizes(output_size, layers.back()->in_sz);
@@ -606,7 +606,7 @@ public:
             ok = ok && read_exact(f, L->b.data(), sizeof(double) * L->b.size());
             if (!ok) break;
 
-            // Adam stav po loadu nulujeme — začínáme „čistě“
+            // Adam stav po loadu nulujeme — začínáme "čistě"
             L->adam_W.reset();
             L->adam_b.reset();
 
@@ -628,7 +628,7 @@ public:
 };
 // ---------------------------------------------------------------------------
 // Jednoduché UI okno (Win32 GDI) pro zobrazení průběhu MSE
-// Pozn.: Je to utilitka, ne Photoshop. Má to jen říct „lepší / horší“.
+// Pozn.: Je to utilitka, ne Photoshop. Má to jen říct "lepší / horší".
 // ---------------------------------------------------------------------------
 namespace ui {
     struct MSEState {
@@ -687,7 +687,7 @@ namespace ui {
         const int N = (int)local.size();
         if (W <= 1 || H <= 1 || N < 2) return;
 
-        // modrá linka: aby to vypadalo „profesionálně“
+        // modrá linka: aby to vypadalo "profesionálně"
         HPEN pen = CreatePen(PS_SOLID, 2, RGB(0, 120, 215));
         HGDIOBJ old = SelectObject(hdc, pen);
 
@@ -708,7 +708,7 @@ namespace ui {
         SelectObject(hdc, old);
         DeleteObject(pen);
 
-        // poslední hodnota jako text: rychlé „jak moc to bolí“
+        // poslední hodnota jako text: rychlé "jak moc to bolí"
         wchar_t buf[128];
         swprintf_s(buf, L"MSE: %.6g", local.back());
         TextOutW(hdc, rc.left + 6, rc.top + 6, buf, (int)wcslen(buf));
@@ -825,7 +825,7 @@ namespace ui {
     }
 
     void clear() {
-        // smazat historii, protože někdy prostě potřebuješ „nový začátek“
+        // smazat historii, protože někdy prostě potřebuješ "nový začátek"
         std::lock_guard<std::mutex> lk(g.mtx);
         g.data.clear();
     }
@@ -899,7 +899,7 @@ static void nn_clear_all() {
     g_nn.clear();
 }
 // ---------------------------------------------------------------------------
-// Exportované funkce DLL — tohle je „veřejná tvář“ pro MQL5
+// Exportované funkce DLL — tohle je "veřejná tvář" pro MQL5
 // Pozn.: Všude try/catch, protože MQL5 nechce překvapení ani k Vánocům.
 // ---------------------------------------------------------------------------
 DLL_EXTERN int  DLL_CALL NN_Create() {
@@ -981,7 +981,7 @@ DLL_EXTERN void DLL_CALL NN_SetSeed(unsigned int s) {
 }
 
 // ---------------------------------------------------------------------------
-// UI exporty — „MSE monitor“
+// UI exporty — "MSE monitor"
 // ---------------------------------------------------------------------------
 DLL_EXTERN void DLL_CALL NN_MSE_Push(double m) { try { ui::push(m); } catch (...) {} }
 DLL_EXTERN void DLL_CALL NN_MSE_Show(int s) { try { ui::show(s); } catch (...) {} }
@@ -1011,7 +1011,7 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
     }
     else if (r == DLL_PROCESS_DETACH) {
         // při unloadu uklidit: UI thread i instance sítí
-        // (protože „visící okno“ je klasika, co umí zkazit den)
+        // (protože "visící okno" je klasika, co umí zkazit den)
         ui::shutdown();
         nn_clear_all();
     }
